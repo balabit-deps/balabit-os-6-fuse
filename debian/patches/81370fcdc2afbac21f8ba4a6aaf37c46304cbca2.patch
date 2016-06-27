@@ -1,0 +1,97 @@
+From 81370fcdc2afbac21f8ba4a6aaf37c46304cbca2 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Date: Mon, 20 Jun 2016 20:12:23 +0200
+Subject: [PATCH] libfuse/fuse_daemonize:  wait until daemon child process is
+ ready (#55)
+
+Mounting a FUSE file system remotely using SSH in combination with
+pseudo-terminal allocation (-t), results in "Transport endpoint is
+not connected" errors when trying to access the file system contents.
+
+For example:
+
+  # ssh -t root@localhost  "cmsfs-fuse /dev/disk/by-path/ccw-0.0.0190 /CMSFS"
+  Connection to localhost closed.
+  # ls /CMSFS
+  ls: cannot access '/CMSFS': Transport endpoint is not connected
+
+The cmsfs-fuse main program (which can also be any other FUSE file
+system) calls into the fuse_main() libfuse library function.
+The fuse_main() function later calls fuse_daemonize() to fork the
+daemon process to handle the FUSE file system I/O.
+
+The fuse_daemonize() function calls fork() as usual.  The child
+proceeds with setsid() and then redirecting its file descriptors
+to /dev/null etc.  The parent process, simply exits.
+
+The child's functions and the parent's exit creates a subtle race.
+This is seen with an SSH connection.  The SSH command above calls
+cmsfs-fuse on an allocated pseudo-terminal device (-t option).
+
+If the parent exits, SSH receives the command completion and closes
+the connection, that means, it closes the master side of the
+pseudo-terminal.  This causes a HUP signal being sent to the process
+group on the pseudo-terminal.  At this point in time, the child might
+not have completed the setsid() call and, hence, becomes terminated.
+Note that fuse daemon sets up its signal handlers after fuse_daemonize()
+has completed.
+
+Even if the child has the chance to disassociate from its parent process
+group to become it's own process group with setsid(), the child still
+has the pseudo-terminal opened as stdin, stdout, and stderr.  So the
+pseudo-terminal still behave as controlling terminal and might cause a
+SIGHUP at closing the the master side.
+
+To solve the problem, the parent has to wait until the child (the fuse
+daemon process) has completed its processing, that means, has become
+its own process group with setsid() and closed any file descriptors
+pointing to the pseudo-terminal.
+
+Closes: #27
+
+Reported-by: Ofer Baruch <oferba@il.ibm.com>
+Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+---
+ lib/helper.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+Index: fuse-2.9.4/lib/helper.c
+===================================================================
+--- fuse-2.9.4.orig/lib/helper.c
++++ fuse-2.9.4/lib/helper.c
+@@ -181,6 +181,13 @@ int fuse_daemonize(int foreground)
+ {
+ 	if (!foreground) {
+ 		int nullfd;
++		int waiter[2];
++		char completed;
++
++		if (pipe(waiter)) {
++			perror("fuse_daemonize: pipe");
++			return -1;
++		}
+ 
+ 		/*
+ 		 * demonize current process by forking it and killing the
+@@ -193,6 +200,7 @@ int fuse_daemonize(int foreground)
+ 		case 0:
+ 			break;
+ 		default:
++			read(waiter[0], &completed, sizeof(completed));
+ 			_exit(0);
+ 		}
+ 
+@@ -211,6 +219,12 @@ int fuse_daemonize(int foreground)
+ 			if (nullfd > 2)
+ 				close(nullfd);
+ 		}
++
++		/* Propagate completion of daemon initializatation */
++		completed = 1;
++		write(waiter[1], &completed, sizeof(completed));
++		close(waiter[0]);
++		close(waiter[1]);
+ 	}
+ 	return 0;
+ }
